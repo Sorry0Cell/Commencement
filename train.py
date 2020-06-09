@@ -9,118 +9,98 @@
 
 
 import os
-import json
 import time
-
+import logging
 import numpy as np
 import tensorflow as tf
 
-import losses
-import my_readers
-
-from model import lstm, cnn, attention
-from get_input import get_input_train_tensors, get_input_test_tensors
+from model import lstm, cnn, attention, mix
+from readers import get_input_arr
+from utils import find_class_by_name
 
 import tensorflow.contrib.slim as slim
 from tensorflow import app
 from tensorflow import flags
 from tensorflow import gfile
-from tensorflow import logging
-import utils
 
 from sklearn.metrics import accuracy_score
-from sklearn import metrics
+
 
 FLAGS = flags.FLAGS
 
-if __name__ == "__main__":
-    # task flags.
-    flags.DEFINE_string("task", "", "Task name. ")
-    # data flags.
-    flags.DEFINE_string("train_dir", "./train_dir",
-                        "The directory to save the checkpoint.")
-    flags.DEFINE_string("train_data_pattern", "",
-                        "File glob for the training dataset. ")
-    flags.DEFINE_string("test_data_pattern", "",
-                        "File glob for the testing dataset. ")
-    flags.DEFINE_integer("vocab_size", 27,
-                         "Predict class num. ")
+# task flags.
+flags.DEFINE_string("task", "StockPred_CNN", "Task name. ")
+flags.DEFINE_string("train_dir", "./train_dir/cnn_test_layer_1417_3_10_5",
+                    "The directory to save the checkpoint.")
+flags.DEFINE_string("model", "CNNModel",
+                    "Which architecture to use for the model. Models are defined in models.py.")
+# data flags.
+flags.DEFINE_string("train_data_pattern", "tmp/201417_train_5_1_1219.csv", "File glob for the training dataset. ")
+flags.DEFINE_string("test_data_pattern", "tmp/201417_test_5_1_1219.csv", "File glob for the testing dataset. ")
 
-    # model flags.
-    flags.DEFINE_string(
-        "model", "LSTMModel",
-        "Which architecture to use for the model. Models are defined in models.py.")
-    flags.DEFINE_bool(
-        "start_new_model", False,
-        "If set, this will not resume from a checkpoint and will instead create a new model instance.")
+flags.DEFINE_integer("input_window", 5, "How many days history data used. ")
+flags.DEFINE_integer("feat_dim", 10, "Dimension of features. ")
+flags.DEFINE_integer("vocab_size", 27, "Predict class num. ")
 
-    # Training flags.
-    flags.DEFINE_integer("train_batch_size", 128,
-                         "How many examples to process per batch for training.")
-    flags.DEFINE_integer("test_batch_size", 128,
-                         "How many examples to process per batch for testing.")
-    flags.DEFINE_integer("test_interval", 100,
-                         "How many iterations to process a test.")
-    flags.DEFINE_string("label_loss", "CrossEntropyLoss",
-                        "Which loss function to use for training the model.")
-    flags.DEFINE_float("regularization_penalty", 1,
-                       "How much weight to give to the regularization loss (the label loss has a weight of 1).")
-    flags.DEFINE_float("base_learning_rate", 0.001,
-                       "Which learning rate to start with.")
-    flags.DEFINE_float("learning_rate_decay", 0.9,
-                       "Learning rate decay factor to be applied every learning_rate_decay_steps.")
-    flags.DEFINE_float("learning_rate_decay_steps", 100000,
-                       "Multiply current learning rate by learning_rate_decay every learning_rate_decay_steps.")
-    flags.DEFINE_integer("num_epochs", 20, "How many passes to make over the dataset before halting training.")
-    flags.DEFINE_integer("max_steps", None, "The maximum number of iterations of the training loop.")
+# model flags.
+flags.DEFINE_bool("start_new_model", True,
+                  "If set, this will not resume from a checkpoint and will instead create a new model instance.")
+flags.DEFINE_integer("hidden_size", 128, "Attention Encoder hidden size. ")
 
-    # other flags.
-    flags.DEFINE_integer("num_readers", 1,
-                         "How many threads to use for reading input files.")
-    flags.DEFINE_string("optimizer", "AdamOptimizer", "What optimizer class to use.")
-    flags.DEFINE_float("clip_gradient_norm", 1.0, "Norm to clip gradients to.")
-    flags.DEFINE_bool("log_device_placement", False,
-                      "Whether to write the device on which every op will run into the logs on startup.")
-    flags.DEFINE_bool("allow_soft_placement", False,
-                      "Whether to use other device if not GPU .")
+# Training flags.
+flags.DEFINE_integer("num_epochs", 20,
+                     "How many passes to make over the dataset before halting training.")
+flags.DEFINE_integer("batch_size", 128,
+                     "How many examples to process per batch.")
+flags.DEFINE_integer("test_interval", 2000,
+                     "How many iterations to process a test.")
+flags.DEFINE_integer("log_interval", 100,
+                     "How many iterations to log during training.")
+flags.DEFINE_float("regularization_penalty", 1,
+                   "How much weight to give to the regularization loss (the label loss has a weight of 1).")
+flags.DEFINE_float("base_learning_rate", 0.0001,
+                   "Which learning rate to start with.")
+flags.DEFINE_float("learning_rate_decay", 0.95,
+                   "Learning rate decay factor to be applied every learning_rate_decay_steps.")
+flags.DEFINE_float("learning_rate_decay_steps", 1000,
+                   "Multiply current learning rate by learning_rate_decay every learning_rate_decay_steps.")
 
-
-def find_class_by_name(name, modules):
-    """Searches the provided modules for the named class and returns it."""
-    modules = [getattr(module, name, None) for module in modules]
-    return next(a for a in modules if a)
+# other flags.
+flags.DEFINE_string("optimizer", "AdamOptimizer", "What optimizer class to use.")
+flags.DEFINE_float("clip_gradient_norm", 1.0, "Norm to clip gradients to.")
+flags.DEFINE_bool("log_device_placement", False,
+                  "Whether to write the device on which every op will run into the logs on startup.")
+flags.DEFINE_bool("allow_soft_placement", False,
+                  "Whether to use other device if not GPU .")
+flags.DEFINE_string("col_label", "label", "Column name of label in csv file.")
+flags.DEFINE_string("col_date", "date", "Column name of date in csv file.")
+flags.DEFINE_string("col_stk_id", "stk_id", "Column name of stk_id in csv file.")
 
 
 def build_graph(model,
-                reader,
-                train_data_pattern,
-                test_data_pattern,
-                label_loss_fn=losses.CrossEntropyLoss(),
+                input_window,
+                feat_dim,
+                optimizer_class=tf.train.AdamOptimizer,
                 base_learning_rate=0.01,
                 learning_rate_decay_steps=10000,
                 learning_rate_decay=0.95,
-                optimizer_class=tf.train.AdamOptimizer,
-                clip_gradient_norm=1.0,
-                regularization_penalty=1,
-                num_readers=1,
-                num_epochs=None):
+                clip_gradient_norm=1.0):
     """
-    Creates the Tensorflow graph.
+    Create Tensorflow graph.
     :param model: The core model (e.g. logistic or neural net). It should inherit from BaseModel.
-    :param reader: The data file reader. It should inherit from BaseReader.
-    :param train_data_pattern: path to the train data files.
-    :param test_data_pattern: path to the test data files.
-    :param label_loss_fn: loss to apply to the model. It should inherit from BaseLoss.
+    :param input_window: How many days history data used.
+    :param feat_dim: Dimension of each day's data.
+    :param optimizer_class: Which optimization algorithm to use.
     :param base_learning_rate: learning rate to initialize the optimizer with.
     :param learning_rate_decay_steps:
     :param learning_rate_decay:
-    :param optimizer_class: Which optimization algorithm to use.
     :param clip_gradient_norm: Magnitude of the gradient to clip to.
-    :param regularization_penalty: How much weight to give the regularization loss compared to the label loss.
-    :param num_readers:
-    :param num_epochs:
     :return:
     """
+
+    model_stk_input = tf.placeholder(tf.float32, [None, input_window * feat_dim], name="model_stk_input")
+    model_stk_label = tf.placeholder(tf.int32, [None, ], name="model_stk_label")
+    is_training = tf.placeholder(tf.bool, name="is_training")
 
     global_step = tf.Variable(0, trainable=False, name="global_step")
 
@@ -133,194 +113,95 @@ def build_graph(model,
 
     optimizer = optimizer_class(learning_rate)
 
-    _, train_stk_input, train_stk_label = get_input_train_tensors(
-        reader, train_data_pattern, batch_size=FLAGS.train_batch_size, num_readers=num_readers, num_epochs=num_epochs)
-
-    _, test_stk_input, test_stk_label = get_input_test_tensors(
-        reader, test_data_pattern, batch_size=FLAGS.test_batch_size, num_readers=1)
-
-    train_stk_feature_dim = len(train_stk_input.get_shape()) - 1
-    test_stk_feature_dim = len(test_stk_input.get_shape()) - 1
-
-    assert train_stk_feature_dim == test_stk_feature_dim
-
-    train_stk_model_input = tf.nn.l2_normalize(train_stk_input, train_stk_feature_dim)
-    test_stk_model_input = tf.nn.l2_normalize(test_stk_input, test_stk_feature_dim)
-
     with tf.variable_scope("model", reuse=tf.AUTO_REUSE):
-        train_result = model.create_model(train_stk_model_input)
-        test_result = model.create_model(test_stk_model_input)
+        model_result = model.create_model(model_stk_input, model_stk_label, is_training)
 
-        train_predictions = train_result["predictions"]
-        test_predictions = test_result["predictions"]
-        stk_embedding = test_result["stk_embedding"]
+        # model_stk_embedding = model_result["stk_embedding"]
+        model_predictions = model_result["predictions"]
+        model_logits = model_result["logits"]
+        model_loss = model_result["loss"]
 
-        if "loss" in train_result.keys():
-            train_loss = train_result["loss"]
-        else:
-            train_loss = label_loss_fn.calculate_loss(train_predictions, train_stk_label)
-
-        train_aux_loss = tf.constant(0.0)
-        if "aux_predictions" in train_result.keys():
-            for pred in train_result["aux_predictions"]:
-                train_aux_loss += label_loss_fn.calculate_loss(pred, test_stk_label)
-
-        if "regularization_loss" in train_result.keys():
-            train_reg_loss = train_result["regularization_loss"]
-        else:
-            train_reg_loss = tf.constant(0.0)
-
-        train_reg_losses = tf.losses.get_regularization_losses()
-        if train_reg_losses:
-            train_reg_loss += tf.add_n(train_reg_losses)
-
-        if "loss" in test_result.keys():
-            test_loss = test_result["loss"]
-        else:
-            test_loss = label_loss_fn.calculate_loss(test_predictions, test_stk_label)
-
-        # A dependency to the train_op.
-        update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
-        if "update_ops" in train_result.keys():
-            update_ops += train_result["update_ops"]
-        if update_ops:
-            with tf.control_dependencies(update_ops):
-                barrier = tf.no_op(name="gradient_barrier")
-                with tf.control_dependencies([barrier]):
-                    train_loss = tf.identity(train_loss)
-                    train_aux_loss = tf.identity(train_aux_loss)
-
-        # Incorporate the L2 weight penalties etc.
-        train_final_loss = regularization_penalty * train_reg_loss + train_loss + train_aux_loss
+        # debug nan
+        # model_hidden = model_result["hidden"]
+        # model_cnn_out = model_result["cnn_out"]
+        # model_cnn_input = model_result["cnn_input"]
 
         train_op = slim.learning.create_train_op(
-            train_final_loss,
+            model_loss,
             optimizer,
             global_step=global_step,
             clip_gradient_norm=clip_gradient_norm)
 
         tf.add_to_collection("global_step", global_step)
-        tf.add_to_collection("train_loss", train_loss)
-        tf.add_to_collection("test_top_loss", test_loss)
-        tf.add_to_collection("train_predictions", train_predictions)
-        tf.add_to_collection("test_predictions", test_predictions)
-        tf.add_to_collection("train_stk_input", train_stk_input)
-        tf.add_to_collection("train_stk_model_input", train_stk_model_input)
-        tf.add_to_collection("test_stk_input", test_stk_input)
-        tf.add_to_collection("test_stk_model_input", test_stk_model_input)
-        tf.add_to_collection("train_stk_label", tf.cast(train_stk_label, tf.float32))
-        tf.add_to_collection("test_stk_label", tf.cast(test_stk_label, tf.float32))
-        tf.add_to_collection("stk_embedding", stk_embedding)
+
+        tf.add_to_collection("model_stk_input", model_stk_input)
+        tf.add_to_collection("model_stk_label", model_stk_label)
+        tf.add_to_collection("is_training", is_training)
+
+        # tf.add_to_collection("stk_embedding", model_stk_embedding)
+        tf.add_to_collection("model_predictions", model_predictions)
+        tf.add_to_collection("model_logits", model_logits)
+        tf.add_to_collection("model_loss", model_loss)
+
         tf.add_to_collection("train_op", train_op)
+
+        # debug nan
+        # tf.add_to_collection("model_hidden", model_hidden)
+        # tf.add_to_collection("model_cnn_out", model_cnn_out)
+        # tf.add_to_collection("model_cnn_input", model_cnn_input)
 
 
 class Trainer(object):
     """A Trainer to train a Tensorflow graph."""
 
-    def __init__(self, task, train_dir, model, reader,
-                 log_device_placement=True,
-                 allow_soft_placement=True,
-                 max_steps=None):
+    def __init__(self, task, model, input_window, feat_dim, hidden_size, train_dir, epochs, batch_size,
+                 log_device_placement=True, allow_soft_placement=True):
         """
         Creates a Trainer.
         :param task:
-        :param train_dir:
         :param model:
-        :param reader:
+        :param input_window:
+        :param feat_dim:
+        :param hidden_size:
+        :param train_dir:
+        :param epochs:
+        :param batch_size:
         :param log_device_placement:
-        :param max_steps:
+        :param allow_soft_placement:
         """
         self.task = task
-        self.train_dir = train_dir
         self.model = model
-        self.reader = reader
-
+        self.input_window = input_window
+        self.feat_dim = feat_dim
+        self.hidden_size = hidden_size
+        self.train_dir = train_dir
         self.config = tf.ConfigProto(log_device_placement=log_device_placement,
                                      allow_soft_placement=allow_soft_placement)
-        self.max_steps = max_steps
-        self.max_steps_reached = False
+        self.epochs = epochs
+        self.batch_size = batch_size
         self.last_model_eval_precision = 0.0
         self.last_model_export_step = 0
 
-    def run(self, start_new_model=False):
-        """Performs training on the currently defined Tensorflow graph.
+        if not os.path.exists(self.train_dir):
+            os.makedirs(self.train_dir)
 
-        Returns:
-          A tuple of the training Hit@1 and the training PERR.
-        """
+    def build_model(self):
+        """Find the model and build the graph."""
 
-        meta_filename = self.get_meta_filename(start_new_model, self.train_dir)
+        optimizer_class = find_class_by_name(FLAGS.optimizer, [tf.train])
+        model = find_class_by_name(FLAGS.model, [lstm, cnn, attention, mix])(
+            self.input_window, self.feat_dim, self.hidden_size)
 
-        with tf.Graph().as_default() as graph:
+        build_graph(model=model,
+                    input_window=self.input_window,
+                    feat_dim=self.feat_dim,
+                    optimizer_class=optimizer_class,
+                    base_learning_rate=FLAGS.base_learning_rate,
+                    learning_rate_decay=FLAGS.learning_rate_decay,
+                    learning_rate_decay_steps=FLAGS.learning_rate_decay_steps,
+                    clip_gradient_norm=FLAGS.clip_gradient_norm)
 
-            if meta_filename:
-                saver = self.recover_model(meta_filename)
-            else:
-                saver = self.build_model(self.model, self.reader)
-
-            global_step = tf.get_collection("global_step")[0]
-            train_top_loss = tf.get_collection("train_loss")[0]
-            test_top_loss = tf.get_collection("test_top_loss")[0]
-            train_predictions = tf.get_collection("train_predictions")[0]
-            test_predictions = tf.get_collection("test_predictions")[0]
-            train_top_labels = tf.get_collection("train_top_labels")[0]
-            test_top_labels = tf.get_collection("test_top_labels")[0]
-            train_op = tf.get_collection("train_op")[0]
-            init_op = tf.global_variables_initializer()
-
-        logging.info("%s: Starting session.", self.task)
-        with tf.Session(config=self.config) as sess:
-
-            # try:
-            if 1:
-                logging.info("Entering training loop.")
-                while not self.max_steps_reached:
-
-                    batch_start_time = time.time()
-                    _, global_step_val, train_top_loss_val, train_predictions_val, train_top_labels_val = sess.run(
-                        [train_op, global_step, train_top_loss, train_predictions, train_top_labels])
-                    seconds_per_batch = time.time() - batch_start_time
-                    if self.max_steps and self.max_steps <= global_step_val:
-                        self.max_steps_reached = True
-
-                    if global_step_val % 10 == 0:
-                        train_metric = utils.CalMetric(train_predictions_val, train_top_labels_val)
-                        logging.info("%s: training step " + str(global_step_val) + " top_precision: " + (
-                                    "%.4f" % train_metric['top_precision']) + " top_recall: " + (
-                                                 "%.4f" % train_metric['top_recall']) + " top_f1_score: " + (
-                                                 "%.4f" % train_metric['top_f1_score']) + " top_loss: " + str(
-                            train_top_loss_val) + " cost: " + str(
-                            seconds_per_batch), self.task)
-
-                        if global_step_val % FLAGS.test_interval == 0:
-                            batch_start_time = time.time()
-                            global_step_val, test_top_loss_val, test_predictions_val, test_top_labels_val = sess.run(
-                                [global_step, test_top_loss, test_predictions, test_top_labels])
-                            seconds_per_batch = time.time() - batch_start_time
-                            test_metric = utils.CalMetric(test_predictions_val, test_top_labels_val)
-
-                            logging.info("%s: training step " + str(global_step_val) + \
-                                         " test_top_precision: " + ("%.4f" % test_metric['top_precision']) + \
-                                         " test_top_recall: " + ("%.4f" % test_metric['top_recall']) + \
-                                         "test_top_f1_score: " + ("%.4f" % test_metric['top_f1_score']) + \
-                                         " top_loss: " + str(train_top_loss_val) + " cost: " + str(seconds_per_batch),
-                                         self.task)
-
-                            time_to_export = (test_metric['top_f1_score'] - self.last_model_eval_precision) / (
-                                    self.last_model_eval_precision + 0.0000001) > 0.001 \
-                                             and np.abs(
-                                test_metric['top_f1_score'] - self.last_model_eval_precision) > 0.1 \
-                                             and np.abs(test_metric['top_f1_score']) > 0.65 \
-
-                            if time_to_export:
-                                saver.save(sess, self.train_dir, global_step=global_step_val)
-                                self.last_model_export_step = global_step_val
-
-            # except tf.errors.OutOfRangeError:
-            #     logging.info("%s: Done training -- epoch limit reached.",
-            #                  self.task)
-
-        logging.info("%s: Exited training loop.", self.task)
+        return tf.train.Saver(max_to_keep=2, keep_checkpoint_every_n_hours=5)
 
     def get_meta_filename(self, start_new_model, train_dir):
         if start_new_model:
@@ -341,47 +222,159 @@ class Trainer(object):
 
     def recover_model(self, meta_filename):
         logging.info("%s: Restoring from meta graph file %s", self.task, meta_filename)
-        return tf.train.import_meta_graph(meta_filename)
+        return tf.train.import_meta_graph(meta_filename, clear_devices=True)
 
-    def build_model(self, model, reader):
-        """Find the model and build the graph."""
+    def run(self, train_data_pattern, test_data_pattern=None, start_new_model=False,
+            thresh=0.5, test_interval=500, log_interval=20):
+        """
+        Performs training on the currently defined Tensorflow graph.
+        :param train_data_pattern:
+        :param test_data_pattern:
+        :param start_new_model:
+        :param thresh: used to calc acc
+        :param test_interval: how many steps to eval test dataset
+        :param log_interval: how many steps to log during training
+        :return:
+        """
+        meta_filename = self.get_meta_filename(start_new_model, self.train_dir)
+        save_prefix = os.path.join(self.train_dir, self.task)
+        with tf.Graph().as_default() as graph:
+            if meta_filename:
+                saver = self.recover_model(meta_filename)
+            else:
+                saver = self.build_model()
 
-        label_loss_fn = find_class_by_name(FLAGS.label_loss, [losses])()
-        optimizer_class = find_class_by_name(FLAGS.optimizer, [tf.train])
+            global_step = tf.get_collection("global_step")[0]
 
-        build_graph(model=model,
-                    reader=reader,
-                    optimizer_class=optimizer_class,
-                    clip_gradient_norm=FLAGS.clip_gradient_norm,
-                    train_data_pattern=FLAGS.train_data_pattern,
-                    test_data_pattern=FLAGS.test_data_pattern,
-                    label_loss_fn=label_loss_fn,
-                    base_learning_rate=FLAGS.base_learning_rate,
-                    learning_rate_decay=FLAGS.learning_rate_decay,
-                    learning_rate_decay_steps=FLAGS.learning_rate_decay_steps,
-                    regularization_penalty=FLAGS.regularization_penalty,
-                    num_readers=FLAGS.num_readers,
-                    num_epochs=FLAGS.num_epochs)
+            model_stk_input = tf.get_collection("model_stk_input")[0]
+            model_stk_label = tf.get_collection("model_stk_label")[0]
+            is_training = tf.get_collection("is_training")[0]
 
-        return tf.train.Saver(max_to_keep=5, keep_checkpoint_every_n_hours=5)
+            # stk_embedding = tf.get_collection("stk_embedding")[0]
+            model_predictions = tf.get_collection("model_predictions")[0]
+            model_logits = tf.get_collection("model_logits")[0]
+            model_loss = tf.get_collection("model_loss")[0]
 
+            train_op = tf.get_collection("train_op")[0]
 
-def get_reader(reader_type="stk"):
-    if reader_type == "stk":
-        return my_readers.StockReader()
+            # debug nan
+            # model_hidden = tf.get_collection("model_hidden")[0]
+            # model_cnn_out = tf.get_collection("model_cnn_out")[0]
+            # model_cnn_input = tf.get_collection("model_cnn_input")[0]
+
+            init_op = tf.global_variables_initializer()
+
+            logging.info("%s: Starting session.", self.task)
+            with tf.Session(config=self.config) as sess:
+
+                if start_new_model:
+                    sess.run(init_op)
+
+                # sess.run(init_op)
+
+                logging.info("%s: Entering training loop.", self.task)
+                best_test_acc = 0.0
+                train_since = time.time()
+                for i in range(self.epochs):
+                    # 加载整个train_set
+                    train_data_gen = get_input_arr(data_pattern=train_data_pattern, batch_size=self.batch_size,
+                                                   shuffle=True, is_training=True,
+                                                   feat_num=self.input_window * self.feat_dim)
+                    try:
+                        while True:
+                            train_data = next(train_data_gen)
+                            train_batch_input, train_batch_label, _, _ = train_data
+                            batch_since = time.time()
+
+                            _, global_step_val, train_loss_val, train_logits_val, train_pred_val = sess.run(
+                                [train_op, global_step, model_loss, model_logits, model_predictions],
+                                feed_dict={model_stk_input: train_batch_input,
+                                           model_stk_label: train_batch_label,
+                                           is_training: True})
+                            per_batch_time = time.time() - batch_since
+
+                            if global_step_val % log_interval == 0:
+                                # 大于阈值即为1, 否则为0
+                                train_batch_pred = train_pred_val > thresh
+
+                                # logging.info("train_cnn_input: {}".format(train_cnn_input))
+                                # logging.info("train_cnn_out: {}".format(train_cnn_out))
+                                # logging.info("train_hidden_val: {}".format(train_hidden_val))
+                                # logging.info("train_logits_val: {}".format(train_logits_val))
+                                # logging.info("train_pred_val: {}".format(train_pred_val))
+
+                                batch_acc = accuracy_score(y_true=train_batch_label, y_pred=train_batch_pred)
+                                logging.info(
+                                    "{}: training_step {}, train acc {:.4f}, train loss {:.2f},  cost {:.2f} secs.".format(
+                                        self.task, global_step_val, batch_acc, train_loss_val, per_batch_time
+                                    ))
+
+                            if test_data_pattern and global_step_val % test_interval == 0:
+                                logging.info("{}: Measure on test set".format(self.task))
+                                test_data_gen = get_input_arr(data_pattern=test_data_pattern,
+                                                              batch_size=self.batch_size,
+                                                              shuffle=False, is_training=False,
+                                                              feat_num=self.input_window * self.feat_dim)
+                                test_loss_all = []
+                                test_pred_all = []
+                                test_true_all = []
+                                test_since = time.time()
+                                try:
+                                    while True:
+                                        test_data = next(test_data_gen)
+                                        test_batch_input, test_batch_label, _, _ = test_data
+                                        test_loss_val, test_pred_val = sess.run(
+                                            [model_loss, model_predictions],
+                                            feed_dict={model_stk_input: test_batch_input,
+                                                       model_stk_label: test_batch_label,
+                                                       is_training: False})
+                                        test_pred_val = test_pred_val > thresh
+                                        test_loss_all.append(test_loss_val)
+                                        test_pred_all.append(test_pred_val)
+                                        test_true_all.append(test_batch_label)
+                                except StopIteration:
+                                    assert len(test_pred_all) == len(test_true_all)
+
+                                    test_time = time.time() - test_since
+                                    test_loss = np.array(test_loss_all).mean()
+                                    test_pred_all = np.concatenate(test_pred_all)
+                                    test_true_all = np.concatenate(test_true_all)
+
+                                    logging.info("{}: total {} records in test dataset".format(
+                                        self.task, test_pred_all.shape[0]))
+                                    test_acc = accuracy_score(y_true=test_true_all, y_pred=test_pred_all)
+                                    logging.info(
+                                        "{}: training step {}, test acc {:.4f}, test loss {:.2f}, cost {:.2f} sec.".format(
+                                            self.task, global_step_val, test_acc, test_loss, test_time))
+
+                                    if test_acc > best_test_acc:
+                                        best_test_acc = test_acc
+                                        print("Save model .")
+                                        saver.save(sess, save_path=save_prefix, global_step=global_step_val)
+                                        self.last_model_export_step = global_step_val
+                    except StopIteration:
+                        logging.info("{}: Finished {} epochs training.".format(self.task, i + 1))
+
+                # 保存最后train完的模型
+                saver.save(sess, save_path=save_prefix, global_step=global_step_val)
+                train_time = time.time() - train_since
+
+        logging.info("{}: Exited training loop, cost {:.2f} sec .".format(self.task, train_time))
 
 
 def main(_):
-    logging.set_verbosity(tf.logging.INFO)
-    logging.info("Tensorflow version: {}.".format(tf.__version__))
-    model = find_class_by_name(FLAGS.model, [lstm, cnn, attention])()
+    logging.basicConfig(format="%(asctime)s %(name)s:%(levelname)s:%(message)s",
+                        datefmt="%d-%M-%Y %H:%M:%S", level=logging.DEBUG)
 
-    reader = get_reader(FLAGS.vocab_size)
+    logging.info("{}: Tensorflow version: {}.".format(FLAGS.task, tf.__version__))
+    trainer = Trainer(FLAGS.task, FLAGS.model, FLAGS.input_window, FLAGS.feat_dim, FLAGS.hidden_size, FLAGS.train_dir,
+                      FLAGS.num_epochs, FLAGS.batch_size, FLAGS.log_device_placement, FLAGS.allow_soft_placement)
 
-
-    Trainer(FLAGS.task, FLAGS.train_dir, model, reader,
-            FLAGS.log_device_placement, FLAGS.allow_soft_placement,
-            FLAGS.max_steps).run(start_new_model=FLAGS.start_new_model)
+    trainer.run(train_data_pattern=FLAGS.train_data_pattern,
+                test_data_pattern=FLAGS.test_data_pattern,
+                start_new_model=FLAGS.start_new_model,
+                test_interval=FLAGS.test_interval,
+                log_interval=FLAGS.log_interval)
 
 
 if __name__ == "__main__":

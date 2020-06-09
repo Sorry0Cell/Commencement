@@ -80,16 +80,16 @@ def trans_pkl_2_csv(pkl_path="../tmp/2014_train_5_1.pkl", csv_path="../tmp/2014_
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument("--pkl_input", default="../tmp/2014_test_5_1.pkl",
+    parser.add_argument("--pkl_input", default="../tmp/201417_test_5_1_1219.pkl",
                         type=str, help="input data, pkl format ")
-    parser.add_argument("--csv_output", default="../tmp/2014_test_5_1.csv",
+    parser.add_argument("--csv_output", default="../tmp/201417_test_5_1_1219.csv",
                         type=str, help="output data, csv format ")
     args = parser.parse_args()
 
     logging.basicConfig(format="%(asctime)s %(name)s:%(levelname)s:%(message)s",
                         datefmt="%d-%M-%Y %H:%M:%S", level=logging.DEBUG)
     since = time.time()
-    trans_pkl_2_csv(pkl_path=args.pkl_input, csv_path=args.csv_output)
+    trans_pkl_2_csv(pkl_path=args.pkl_input, csv_path=args.csv_output, feat_len=50)
     time_elapsed = time.time() - since
     logging.info("The code runs {:.0f} m {:.0f} s . \n".format(time_elapsed // 60, time_elapsed % 60))
 

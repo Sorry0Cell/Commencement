@@ -17,22 +17,10 @@ import pandas as pd
 from datetime import datetime
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 
+from utils import complete_stk_id
+
 full_col = ['Stkcd', 'Trddt', 'Opnprc', 'Hiprc', 'Loprc', 'Clsprc', 'PB', 'PE', 'Volume', 'turnover_1']
 feat_col = ['Opnprc', 'Hiprc', 'Loprc', 'Clsprc', 'PB', 'PE', 'Volume', 'turnover_1']
-
-
-def complete_stk_id(x):
-    """
-    complete stk_id to be 6 length
-    :param x:
-    :return:
-    """
-    if isinstance(x, int):
-        x = str(x)
-    if len(x) < 6:
-        return "0"*(6-len(x)) + x
-    else:
-        return x
 
 
 def std_scale_data(df):
@@ -237,7 +225,7 @@ def gen_model_data(df, input_window=7, label_window=1,
         stk_id_label = np.array(stk_id_label)
         stk_id_date = np.array(stk_id_date)
 
-        stk_id_str = complete_stk_id(str(stk_id))
+        stk_id_str = complete_stk_id(stk_id)
         input_data[stk_id_str] = {"data": stk_id_data, "label": stk_id_label, "date": stk_id_date}
 
     dataset = {"input_window": input_window, "label_window": label_window, "input_data": input_data}
@@ -310,11 +298,11 @@ def main(args, col_stk_id="Stkcd", col_dt="Trddt", save_dir="../tmp",
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument("--csv_input", default="../data/new_lstm_data_201415_turnover.csv",
+    parser.add_argument("--csv_input", default="../data/lstm_data_201415_turnover.csv",
                         type=str, help="input data, csv format ")
     parser.add_argument("--norm_type", default="std", choices=["std", "min_max"],
                         type=str, help="how to normalize ")
-    parser.add_argument("--by_stk_id", default=False,
+    parser.add_argument("--by_stk_id", default=True,
                         type=bool, help="whether normalize according to stk_id or not ")
     parser.add_argument("--data_date_start", default="2014/1/1",
                         type=str, help="start date of data ")
@@ -342,8 +330,8 @@ if __name__ == '__main__':
     since = time.time()
 
     main(args, save_norm_res=False, save_split_res=False,
-         train_file_name="2014_train_{}_{}.pkl".format(args.input_window, args.label_window),
-         test_file_name="2014_test_{}_{}.pkl".format(args.input_window, args.label_window))
+         train_file_name="2014_train_{}_{}_by_stkid.pkl".format(args.input_window, args.label_window),
+         test_file_name="2014_test_{}_{}_by_stkid.pkl".format(args.input_window, args.label_window))
 
     time_elapsed = time.time() - since
     logging.info("The code runs {:.0f} m {:.0f} s\n".format(time_elapsed // 60, time_elapsed % 60))

@@ -132,8 +132,12 @@ class Attention(tf.layers.Layer):
         logits = tf.matmul(q, k, transpose_b=True)
         logits += bias
         weights = tf.nn.softmax(logits, name="attention_weights")
-        if self.train:
-            weights = tf.nn.dropout(weights, 1.0 - self.attention_dropout)
+        # if self.train:
+        #     weights = tf.nn.dropout(weights, 1.0 - self.attention_dropout)
+
+        weights = tf.cond(self.train, lambda: tf.nn.dropout(weights, 1.0 - self.attention_dropout),
+                          lambda: weights)
+
         print("weights shape:", weights.shape)
         print("v shape: ", v.shape)
         attention_output = tf.matmul(weights, v)
